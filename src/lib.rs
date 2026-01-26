@@ -3,6 +3,7 @@ use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// This is like a tradional Mutex, or a non rust Mutex.
+/// Can lock around code blocks, not data like Rust Concurrency primitives typically do.
 pub struct MinimalSpinLock {
     locked: AtomicBool,
 }
