@@ -615,7 +615,7 @@ pub mod arc_with_weak_pointers {
 
     struct ArcData<T> {
         // total number of references, ie weak + strong count
-        ref_count: AtomicUsize,
+        data_ref_count: AtomicUsize,
         // total number of strong references, ie only strong count
         alloc_count: AtomicUsize,
         // Some when strong count >= 1, 0 when strong count == 0 and weak count >= 1
@@ -629,19 +629,13 @@ pub mod arc_with_weak_pointers {
             let data = UnsafeCell::new(Some(data));
 
             ArcData {
-                ref_count: AtomicUsize::new(1),
+                data_ref_count: AtomicUsize::new(1),
                 alloc_count: AtomicUsize::new(1),
                 data,
             }
         }
 
-        fn increment_ref_count(&self) {
-            if self.ref_count.fetch_add(1, Ordering::Relaxed) > usize::MAX / 2 {
-                std::process::abort()
-            }
-        }
-
-        fn increment_alloc_count(&self) {
+        fn increment_alloc_ref_count(&self) {
             if self.alloc_count.fetch_add(1, Ordering::Relaxed) > usize::MAX / 2 {
                 std::process::abort()
             }
@@ -651,14 +645,16 @@ pub mod arc_with_weak_pointers {
             self.alloc_count.fetch_sub(1, Ordering::Release)
         }
 
-        fn decrement_ref_count(&self) -> usize {
-            self.ref_count.fetch_sub(1, Ordering::Release)
+        fn decrement_data_ref_count(&self) -> usize {
+            self.data_ref_count.fetch_sub(1, Ordering::Release)
         }
     }
 
     // We use a weak ref inside the actual Arc.
     // We can think of WeakRef of the mechanism to keep the data inside ArcData<T> alive.
-    // An thus the Arc actually needs to hold a WeakRef T and add behavior on top of it. There is a difference here between the "lifetime" of the container holding the data and the data itself. The container may live longer than the actual data.
+    // An thus the Arc actually needs to hold a WeakRef T and add behavior on top of it.
+    // There is a difference here between the "lifetime" of the container holding the data
+    // and the data itself. The container may live longer than the actual data.
     pub struct MyArc<T> {
         weak: WeakRef<T>,
     }
@@ -667,6 +663,31 @@ pub mod arc_with_weak_pointers {
         pub fn new(data: T) -> MyArc<T> {
             MyArc {
                 weak: WeakRef::new(data),
+            }
+        }
+
+        pub fn get_mut(arc: &mut MyArc<T>) -> Option<&mut T> {
+            // here we want to ensure that the allocation count, ie the strong count, is 1 to hold
+            // the property only a single owner of MyArc<T>.
+            // Load the current allocation count and ensure that there is a single owner.
+            // We can use Relaxed ordering herer given the total modification order.
+            // We use an Acquire fence around this load to ensure the happens before relationship
+            // with any subsequent load of the atomic.
+            // Then we access the NonNull inside WeakRef. Then acquire the internal data
+            // inside the UnsafeCell. The data inside the Option<T> should be Some if the
+            // invariants are upheld here.
+            // The check for all allocations protects the case where a WeakRef<T> is upgraded to a
+            // strong Arc.
+
+            if arc.weak.data().alloc_count.load(Ordering::Relaxed) == 1 {
+                fence(Ordering::Acquire);
+                let arc_data = unsafe { arc.weak.arc_ptr.as_mut() };
+                let arc_data_option = arc_data.data.get_mut();
+                let data = arc_data_option.as_mut().unwrap();
+
+                Some(data)
+            } else {
+                None
             }
         }
     }
@@ -681,12 +702,24 @@ pub mod arc_with_weak_pointers {
         }
     }
 
+    impl<T> Clone for MyArc<T> {
+        fn clone(&self) -> MyArc<T> {
+            let weak = self.weak.clone();
+
+            if weak.data().data_ref_count.fetch_add(1, Ordering::Relaxed) == 1 {
+                std::process::abort()
+            }
+
+            MyArc { weak }
+        }
+    }
+
     impl<T> Drop for MyArc<T> {
         fn drop(&mut self) {
             // We need to decrement the global ref count here.
             // Decrement the global ref counter here, then when the weak gets dropped, the alloc
             // counter will get decremented.
-            if self.weak.decrement_ref_count() == 1 {
+            if self.weak.data().decrement_data_ref_count() == 1 {
                 fence(Ordering::Acquire);
                 let ptr = self.weak.data().data.get();
 
@@ -714,15 +747,39 @@ pub mod arc_with_weak_pointers {
             unsafe { self.arc_ptr.as_ref() }
         }
 
-        fn decrement_ref_count(&self) -> usize {
-            unsafe { self.arc_ptr.as_ref().decrement_ref_count() }
+        pub fn upgrade(&self) -> Option<MyArc<T>> {
+            let mut n = self.data().data_ref_count.load(Ordering::Relaxed);
+
+            loop {
+                // if there are no more strong references left, then no upgrade is available.
+                if n == 0 {
+                    return None;
+                }
+
+                assert!(n < usize::MAX);
+
+                // comosre exchange to ensure that the ref count has not changed since we read to
+                // ensure the ref count has not been updated by another thread in the meantime.
+                if let Err(e) = self.data().data_ref_count.compare_exchange_weak(
+                    n,
+                    n + 1,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                ) {
+                    n = e;
+                    continue;
+                }
+
+                // when the compare and exchange suceeds
+                return Some(MyArc { weak: self.clone() });
+            }
         }
     }
 
     impl<T> Clone for WeakRef<T> {
         fn clone(&self) -> WeakRef<T> {
             // ensure there is a valid
-            unsafe { self.arc_ptr.as_ref().increment_alloc_count() };
+            unsafe { self.arc_ptr.as_ref().increment_alloc_ref_count() };
             WeakRef {
                 arc_ptr: self.arc_ptr,
             }
@@ -733,7 +790,7 @@ pub mod arc_with_weak_pointers {
         fn drop(&mut self) {
             // when the allocation count goes to 0, then we drop the underlying data held in the
             // ArcData<T>, as there a no more strong references.
-            if unsafe { self.arc_ptr.as_ref().decrement_alloc_count() } == 1 {
+            if unsafe { self.arc_ptr.as_ref().decrement_alloc_count() } > usize::MAX {
                 fence(Ordering::Acquire);
                 unsafe { drop(Box::from_raw(self.arc_ptr.as_ptr())) }
             }
