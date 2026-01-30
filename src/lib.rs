@@ -387,6 +387,116 @@ pub mod type_safe_oneshot_channel_ref {
     }
 }
 
+pub mod basic_blocking_channel {
+    use std::cell::UnsafeCell;
+    use std::marker::PhantomData;
+    use std::mem::MaybeUninit;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::thread::{self, Thread};
+
+    // The contraint here is that the receiver cannot be moved to another thread.
+    // The sender holds a thread handle for the consumer to wake the consumer when data becomes
+    // available in the channel. Using the same borrowing approach to hold a reference to the
+    // channel.
+
+    pub struct Sender<'a, T> {
+        channel: &'a Channel<T>,
+        receiver_handle: Thread,
+    }
+
+    impl<T> Sender<'_, T> {
+        pub fn send(&self, message: T) {
+            self.channel.write_message(message);
+            self.receiver_handle.unpark();
+        }
+    }
+
+    pub struct Receiver<'a, T> {
+        channel: &'a Channel<T>,
+        // const pointers, or more broadly raw pointers in general, are not Send, thus the
+        // receiver cannot be moved to a new thread moving the receiver to a new thread would
+        // invalidate the thread handle held by the sender.
+        _no_send: PhantomData<*const ()>,
+    }
+
+    /// Only providing a block recv method here
+    impl<T> Receiver<'_, T> {
+        pub fn recv(&self) -> T {
+            // thread parking is done internally in the channel, thus this stays a simple wrapper
+            // method.
+            self.channel.read_message()
+        }
+    }
+
+    pub struct Channel<T> {
+        message: UnsafeCell<MaybeUninit<T>>,
+        ready: AtomicBool,
+    }
+
+    unsafe impl<T> Sync for Channel<T> where T: Send {}
+
+    impl<T> Channel<T> {
+        pub fn new() -> Channel<T> {
+            Channel {
+                message: UnsafeCell::new(MaybeUninit::uninit()),
+                ready: AtomicBool::new(false),
+            }
+        }
+
+        pub fn split(&mut self) -> (Sender<T>, Receiver<T>) {
+            // here we are using a trick to coerce an exclusive referrence into mutliple shared
+            // references here.
+            //
+            // This lets us do 2 things
+            //      1. Pass a reference to both the sender and receiver
+            //      2. statically prevent any other construction of the sender and receiver,
+            //         preserving the property on a oneshot channel
+            //
+            // This is called reborrowing
+            // The lifetime of the shared references are bound to the lifetime of the exclusive
+            // reference
+            *self = Self::new();
+
+            (
+                Sender {
+                    channel: self,
+                    receiver_handle: thread::current(),
+                },
+                Receiver {
+                    channel: self,
+                    _no_send: PhantomData,
+                },
+            )
+        }
+
+        fn write_message(&self, message: T) {
+            debug_assert!(!self.ready.load(Ordering::Acquire));
+
+            unsafe { (*self.message.get()).write(message) };
+            self.ready.store(true, Ordering::Release);
+        }
+
+        fn read_message(&self) -> T {
+            // need to set ready back to false so no attempt is made to drop the data inside the
+            // MaybeUninit. Using an atomic swap here.
+            while !self.ready.swap(false, Ordering::Acquire) {
+                thread::park()
+            }
+
+            unsafe { (*self.message.get()).assume_init_read() }
+        }
+    }
+
+    impl<T> Drop for Channel<T> {
+        fn drop(&mut self) {
+            // we only need to drop the data if has been written but not read
+            if *self.ready.get_mut() {
+                unsafe { self.message.get_mut().assume_init_drop() }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
@@ -460,6 +570,18 @@ mod test {
             while !receiver.is_ready() {
                 thread::park();
             }
+
+            assert_eq!(receiver.recv(), 1);
+        })
+    }
+
+    #[test]
+    fn blocking_oneshot_sender() {
+        let mut channel = basic_blocking_channel::Channel::new();
+
+        thread::scope(|s| {
+            let (sender, receiver) = channel.split();
+            s.spawn(move || sender.send(1));
 
             assert_eq!(receiver.recv(), 1);
         })
