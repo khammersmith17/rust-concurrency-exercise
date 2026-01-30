@@ -195,7 +195,7 @@ pub mod basic_one_shot_channel {
     }
 }
 
-pub mod type_safe_oneshot_channel {
+pub mod arc_type_safe_oneshot_channel {
     use std::cell::UnsafeCell;
     use std::mem::MaybeUninit;
     use std::sync::{
@@ -291,6 +291,102 @@ pub mod type_safe_oneshot_channel {
     }
 }
 
+pub mod type_safe_oneshot_channel_ref {
+    /// The idea here is to avoid the overhead of Arc
+    /// But this requires some additional restrictions, ie the channel must have a longer lifetime
+    /// than the sender and receiver.
+    use std::cell::UnsafeCell;
+    use std::mem::MaybeUninit;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    pub struct Sender<'a, T> {
+        channel: &'a Channel<T>,
+    }
+
+    impl<T> Sender<'_, T> {
+        pub fn send(&self, message: T) {
+            self.channel.write_message(message);
+        }
+    }
+
+    pub struct Receiver<'a, T> {
+        channel: &'a Channel<T>,
+    }
+
+    impl<T> Receiver<'_, T> {
+        pub fn is_ready(&self) -> bool {
+            self.channel.is_ready()
+        }
+
+        // move self so it is dropped when a user calls recv().
+        // this prevents any additional attempt to read the data at compile time
+        pub fn recv(self) -> T {
+            self.channel.read_message()
+        }
+    }
+
+    pub struct Channel<T> {
+        message: UnsafeCell<MaybeUninit<T>>,
+        ready: AtomicBool,
+    }
+
+    unsafe impl<T> Sync for Channel<T> where T: Send {}
+
+    impl<T> Channel<T> {
+        pub fn new() -> Channel<T> {
+            Channel {
+                message: UnsafeCell::new(MaybeUninit::uninit()),
+                ready: AtomicBool::new(false),
+            }
+        }
+
+        pub fn split(&mut self) -> (Sender<T>, Receiver<T>) {
+            // here we are using a trick to coerce an exclusive referrence into mutliple shared
+            // references here.
+            //
+            // This lets us do 2 things
+            //      1. Pass a reference to both the sender and receiver
+            //      2. statically prevent any other construction of the sender and receiver,
+            //         preserving the property on a oneshot channel
+            //
+            // This is called reborrowing
+            // The lifetime of the shared references are bound to the lifetime of the exclusive
+            // reference
+            *self = Self::new();
+
+            (Sender { channel: self }, Receiver { channel: self })
+        }
+
+        fn is_ready(&self) -> bool {
+            self.ready.load(Ordering::Relaxed)
+        }
+
+        fn write_message(&self, message: T) {
+            debug_assert!(!self.ready.load(Ordering::Acquire));
+
+            unsafe { (*self.message.get()).write(message) };
+            self.ready.store(true, Ordering::Release);
+        }
+
+        fn read_message(&self) -> T {
+            // need to set ready back to false so no attempt is made to drop the data inside the
+            // MaybeUninit. Using an atomic swap here.
+            debug_assert!(self.ready.swap(false, Ordering::Acquire));
+
+            unsafe { (*self.message.get()).assume_init_read() }
+        }
+    }
+
+    impl<T> Drop for Channel<T> {
+        fn drop(&mut self) {
+            // we only need to drop the data if has been written but not read
+            if *self.ready.get_mut() {
+                unsafe { self.message.get_mut().assume_init_drop() }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
@@ -330,5 +426,42 @@ mod test {
         });
 
         assert_eq!(channel.recv(), String::from("hello world"))
+    }
+
+    #[test]
+    fn arc_oneshot_channel() {
+        let (sender, receiver) = arc_type_safe_oneshot_channel::channel();
+
+        thread::scope(|s| {
+            let t = thread::current();
+            s.spawn(move || {
+                sender.send(1);
+                t.unpark();
+            });
+            while !receiver.is_ready() {
+                thread::park();
+            }
+
+            assert_eq!(receiver.recv(), 1);
+        })
+    }
+
+    #[test]
+    fn test_ref_oneshot_channel() {
+        let mut channel = type_safe_oneshot_channel_ref::Channel::new();
+
+        thread::scope(|s| {
+            let (sender, receiver) = channel.split();
+            let t = thread::current();
+            s.spawn(move || {
+                sender.send(1);
+                t.unpark();
+            });
+            while !receiver.is_ready() {
+                thread::park();
+            }
+
+            assert_eq!(receiver.recv(), 1);
+        })
     }
 }
