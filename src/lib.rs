@@ -497,6 +497,250 @@ pub mod basic_blocking_channel {
     }
 }
 
+pub mod basic_arc {
+    use std::ops::Deref;
+    use std::ptr::NonNull;
+    use std::sync::atomic::{AtomicUsize, Ordering, fence};
+    // Basic implementation of Arc<T>
+
+    // internal data structure
+    struct ArcData<T> {
+        ref_count: AtomicUsize,
+        data: T,
+    }
+
+    impl<T> ArcData<T> {
+        fn new(data: T) -> ArcData<T> {
+            ArcData {
+                ref_count: AtomicUsize::new(1),
+                data,
+            }
+        }
+
+        fn increment_ref_count(&self) {
+            // overflow when the ref count exceeds the bounds of usize::MAX / 2
+            // likely will not happen but could. This leaves some space to not overflow in between
+            // the time abort is called and the abort executes.
+            if self.ref_count.fetch_add(1, Ordering::Relaxed) > usize::MAX / 2 {
+                std::process::abort()
+            };
+        }
+
+        fn decrement_ref_count(&self) -> usize {
+            // need Release Ordering here to ensure nothing is accessing the data before it is
+            // dropped.
+            // Return the previous ref count, the value before the fetch sub operation.
+            self.ref_count.fetch_sub(1, Ordering::Release)
+        }
+    }
+
+    // Box does not work here, due to lifetime restrictions and the inability to drop only when the
+    // strong count reaches 0. Box is owned by whoever originally allocated the data here.
+    pub struct MyArc<T> {
+        arc_ptr: NonNull<ArcData<T>>,
+    }
+
+    unsafe impl<T: Send + Sync> Send for MyArc<T> {}
+    unsafe impl<T: Send + Sync> Sync for MyArc<T> {}
+
+    impl<T> MyArc<T> {
+        pub fn new(data: T) -> MyArc<T> {
+            // Leaking here gives up the exclusive reference to the heap allocated data.
+            let arc_ptr = NonNull::from(Box::leak(Box::new(ArcData::new(data))));
+            MyArc { arc_ptr }
+        }
+
+        fn data(&self) -> &ArcData<T> {
+            unsafe { self.arc_ptr.as_ref() }
+        }
+
+        pub fn get_mut(arc: &mut Self) -> Option<&mut T> {
+            // "static" style function on the Arc. Needs to be called via MyArc::get_mut().
+            // This creates a semantic difference for types the implement Deref but not DerefMut to
+            // disambiguite the access style, and make sure conditions hold that make the exclusive access
+            // valid.
+            //
+            // The lifetime of the exclusive reference is bound to the mutable reference on the
+            // MyArc itself, statically defining the property that no other instance of a MyArc can
+            // exist while this exclusive reference is held.
+            //
+            // This is only valid when we can ensure exclusive access to the data, the only case
+            // where this property holds is when the ref count == 1.
+            // We use an acquire fence here when this condition holds to create the happens before
+            // relationship with the mutable access.
+            if arc.data().ref_count.load(Ordering::Relaxed) == 1 {
+                fence(Ordering::Acquire);
+
+                unsafe { Some(&mut arc.arc_ptr.as_mut().data) }
+            } else {
+                None
+            }
+        }
+    }
+
+    impl<T> Clone for MyArc<T> {
+        fn clone(&self) -> MyArc<T> {
+            unsafe { self.arc_ptr.as_ref().increment_ref_count() };
+            MyArc {
+                arc_ptr: self.arc_ptr,
+            }
+        }
+    }
+
+    impl<T> Deref for MyArc<T> {
+        type Target = T;
+        fn deref(&self) -> &T {
+            &self.data().data
+        }
+    }
+
+    impl<T> Drop for MyArc<T> {
+        fn drop(&mut self) {
+            if unsafe { self.arc_ptr.as_ref().decrement_ref_count() } == 1 {
+                // Release ordering is used on the ref count deref.
+                // We establish the happens before relationship here using a fence.
+                // This ordering only needs to be established when dropping.
+                fence(Ordering::Acquire);
+                unsafe { drop(Box::from_raw(self.arc_ptr.as_ptr())) };
+            }
+        }
+    }
+}
+
+pub mod arc_with_weak_pointers {
+    use std::cell::UnsafeCell;
+    use std::ops::Deref;
+    use std::ptr::NonNull;
+    use std::sync::atomic::{AtomicUsize, Ordering, fence};
+
+    struct ArcData<T> {
+        // total number of references, ie weak + strong count
+        ref_count: AtomicUsize,
+        // total number of strong references, ie only strong count
+        alloc_count: AtomicUsize,
+        // Some when strong count >= 1, 0 when strong count == 0 and weak count >= 1
+        // Using UnsafeCell here now to handle the case where the data has been dropped.
+        // And for the interior mutability properties.
+        data: UnsafeCell<Option<T>>,
+    }
+
+    impl<T> ArcData<T> {
+        fn new(data: T) -> ArcData<T> {
+            let data = UnsafeCell::new(Some(data));
+
+            ArcData {
+                ref_count: AtomicUsize::new(1),
+                alloc_count: AtomicUsize::new(1),
+                data,
+            }
+        }
+
+        fn increment_ref_count(&self) {
+            if self.ref_count.fetch_add(1, Ordering::Relaxed) > usize::MAX / 2 {
+                std::process::abort()
+            }
+        }
+
+        fn increment_alloc_count(&self) {
+            if self.alloc_count.fetch_add(1, Ordering::Relaxed) > usize::MAX / 2 {
+                std::process::abort()
+            }
+        }
+
+        fn decrement_alloc_count(&self) -> usize {
+            self.alloc_count.fetch_sub(1, Ordering::Release)
+        }
+
+        fn decrement_ref_count(&self) -> usize {
+            self.ref_count.fetch_sub(1, Ordering::Release)
+        }
+    }
+
+    // We use a weak ref inside the actual Arc.
+    // We can think of WeakRef of the mechanism to keep the data inside ArcData<T> alive.
+    // An thus the Arc actually needs to hold a WeakRef T and add behavior on top of it. There is a difference here between the "lifetime" of the container holding the data and the data itself. The container may live longer than the actual data.
+    pub struct MyArc<T> {
+        weak: WeakRef<T>,
+    }
+
+    impl<T> MyArc<T> {
+        pub fn new(data: T) -> MyArc<T> {
+            MyArc {
+                weak: WeakRef::new(data),
+            }
+        }
+    }
+
+    impl<T> Deref for MyArc<T> {
+        type Target = T;
+        fn deref(&self) -> &T {
+            // deref the UnsafeCell pointer, and return a ref to the underlying data, which
+            // should be Some in this case. The final unwrap is to handle the Option<T> inside the
+            // UnsafeCell.
+            unsafe { (*self.weak.data().data.get()).as_ref().unwrap() }
+        }
+    }
+
+    impl<T> Drop for MyArc<T> {
+        fn drop(&mut self) {
+            // We need to decrement the global ref count here.
+            // Decrement the global ref counter here, then when the weak gets dropped, the alloc
+            // counter will get decremented.
+            if self.weak.decrement_ref_count() == 1 {
+                fence(Ordering::Acquire);
+                let ptr = self.weak.data().data.get();
+
+                // setting the weak ref data pointer to None, so nothing else will access it.
+                unsafe { (*ptr) = None }
+            }
+        }
+    }
+
+    pub struct WeakRef<T> {
+        arc_ptr: NonNull<ArcData<T>>,
+    }
+
+    unsafe impl<T: Send + Sync> Send for WeakRef<T> {}
+    unsafe impl<T: Send + Sync> Sync for WeakRef<T> {}
+
+    impl<T> WeakRef<T> {
+        fn new(data: T) -> WeakRef<T> {
+            WeakRef {
+                arc_ptr: NonNull::from(Box::leak(Box::new(ArcData::new(data)))),
+            }
+        }
+
+        fn data(&self) -> &ArcData<T> {
+            unsafe { self.arc_ptr.as_ref() }
+        }
+
+        fn decrement_ref_count(&self) -> usize {
+            unsafe { self.arc_ptr.as_ref().decrement_ref_count() }
+        }
+    }
+
+    impl<T> Clone for WeakRef<T> {
+        fn clone(&self) -> WeakRef<T> {
+            // ensure there is a valid
+            unsafe { self.arc_ptr.as_ref().increment_alloc_count() };
+            WeakRef {
+                arc_ptr: self.arc_ptr,
+            }
+        }
+    }
+
+    impl<T> Drop for WeakRef<T> {
+        fn drop(&mut self) {
+            // when the allocation count goes to 0, then we drop the underlying data held in the
+            // ArcData<T>, as there a no more strong references.
+            if unsafe { self.arc_ptr.as_ref().decrement_alloc_count() } == 1 {
+                fence(Ordering::Acquire);
+                unsafe { drop(Box::from_raw(self.arc_ptr.as_ptr())) }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
@@ -585,5 +829,40 @@ mod test {
 
             assert_eq!(receiver.recv(), 1);
         })
+    }
+
+    #[test]
+    fn test_basic_arc() {
+        use basic_arc::MyArc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static NUM_DROPS: AtomicUsize = AtomicUsize::new(0);
+
+        struct DetectDrop;
+
+        impl Drop for DetectDrop {
+            fn drop(&mut self) {
+                NUM_DROPS.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        let x = MyArc::new((1, DetectDrop));
+        let y = x.clone();
+
+        let t = std::thread::spawn(move || assert_eq!(x.0, 1));
+
+        assert_eq!(y.0, 1);
+
+        t.join().unwrap();
+
+        // at this point, the ref count should be 1, thus the data inside the arc should have not
+        // been dropped yet. Thus the drop count should be 0.
+        assert_eq!(NUM_DROPS.load(Ordering::Relaxed), 0);
+
+        // drop remaining ref.
+        drop(y);
+
+        // once we drop the remaining ref, the ref count should be 0. Thus, the data inside the Arc
+        // should be dropped.
+        assert_eq!(NUM_DROPS.load(Ordering::Relaxed), 1);
     }
 }
