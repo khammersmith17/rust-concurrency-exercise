@@ -614,13 +614,15 @@ pub mod arc_with_weak_pointers {
     use std::sync::atomic::{AtomicUsize, Ordering, fence};
 
     struct ArcData<T> {
-        // total number of references, ie weak + strong count
+        // This is the strong count, ie the number of Arc that have been created through
+        // Arc.clone().
         data_ref_count: AtomicUsize,
-        // total number of strong references, ie only strong count
+        // This is the total number of allocations, including both strong and weak count.
         alloc_count: AtomicUsize,
-        // Some when strong count >= 1, 0 when strong count == 0 and weak count >= 1
-        // Using UnsafeCell here now to handle the case where the data has been dropped.
-        // And for the interior mutability properties.
+        // When the strong count is > 0, this will be Some.
+        // When only weak references remain, this will be None.
+        // This allows between seperation of lifetimes between the data and the container that
+        // holds the data.
         data: UnsafeCell<Option<T>>,
     }
 
@@ -667,7 +669,7 @@ pub mod arc_with_weak_pointers {
         }
 
         pub fn get_mut(arc: &mut MyArc<T>) -> Option<&mut T> {
-            // here we want to ensure that the allocation count, ie the strong count, is 1 to hold
+            // Here we want to ensure that the allocation count, ie the strong count, is 1 to hold
             // the property only a single owner of MyArc<T>.
             // Load the current allocation count and ensure that there is a single owner.
             // We can use Relaxed ordering herer given the total modification order.
@@ -689,6 +691,9 @@ pub mod arc_with_weak_pointers {
             } else {
                 None
             }
+        }
+        pub fn downgrade(arc: &Self) -> WeakRef<T> {
+            arc.weak.clone()
         }
     }
 
@@ -921,5 +926,52 @@ mod test {
         // once we drop the remaining ref, the ref count should be 0. Thus, the data inside the Arc
         // should be dropped.
         assert_eq!(NUM_DROPS.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn test_arc_weak_ref() {
+        use arc_with_weak_pointers::MyArc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        static NUM_DROPS: AtomicUsize = AtomicUsize::new(0);
+
+        struct DetectDrop;
+
+        impl Drop for DetectDrop {
+            fn drop(&mut self) {
+                NUM_DROPS.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        let x = MyArc::new((1, DetectDrop));
+
+        // create 2 weak refs
+        let y = MyArc::downgrade(&x);
+        let z = MyArc::downgrade(&x);
+
+        let t = std::thread::spawn(move || {
+            // upgrade one of the weak refs
+            // this is valid given that the strong count is 1.
+            let y = y.upgrade().unwrap();
+            // the value loaded should be the same loaded into the initial Arc
+            assert_eq!(y.0, 1);
+        });
+
+        assert_eq!(x.0, 1);
+        t.join().unwrap();
+
+        // data should not be dropped yet.
+        assert_eq!(NUM_DROPS.load(Ordering::Relaxed), 0);
+        // upgrade should be valid given that at least one arc is still valid.
+        assert!(z.upgrade().is_some());
+
+        // dropping the last live Arc.
+        drop(x);
+
+        // data should be dropped at this point.
+        assert_eq!(NUM_DROPS.load(Ordering::Relaxed), 1);
+
+        // upgrade should not work anymore given that the data has been dropped.
+        assert!(z.upgrade().is_none());
     }
 }
