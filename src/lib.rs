@@ -803,6 +803,196 @@ pub mod arc_with_weak_pointers {
     }
 }
 
+pub mod opimized_basic_arc {
+    use std::cell::UnsafeCell;
+    use std::mem::ManuallyDrop;
+    use std::ops::Deref;
+    use std::ptr::NonNull;
+    use std::sync::atomic::{AtomicUsize, Ordering, fence};
+
+    struct ArcData<T> {
+        // The number of Arc's in the wild.
+        data_ref_count: AtomicUsize,
+        // The number of weak refernces + 1 if the number of existing Arc's is >= 1.
+        alloc_count: AtomicUsize,
+        // When the strong count is > 0, this will be Some.
+        // When only weak references remain, this will be None.
+        // This allows between seperation of lifetimes between the data and the container that
+        // holds the data.
+        data: UnsafeCell<ManuallyDrop<T>>,
+    }
+
+    impl<T> ArcData<T> {
+        fn new(data: T) -> ArcData<T> {
+            let data = UnsafeCell::new(ManuallyDrop::new(data));
+
+            ArcData {
+                data_ref_count: AtomicUsize::new(1),
+                alloc_count: AtomicUsize::new(1),
+                data,
+            }
+        }
+    }
+
+    // We use a weak ref inside the actual Arc.
+    // We can think of WeakRef of the mechanism to keep the data inside ArcData<T> alive.
+    // An thus the Arc actually needs to hold a WeakRef T and add behavior on top of it.
+    // There is a difference here between the "lifetime" of the container holding the data
+    // and the data itself. The container may live longer than the actual data.
+    pub struct MyArc<T> {
+        arc_ptr: NonNull<ArcData<T>>,
+    }
+
+    impl<T> MyArc<T> {
+        pub fn new(data: T) -> MyArc<T> {
+            MyArc {
+                arc_ptr: NonNull::from(Box::leak(Box::new(ArcData::new(data)))),
+            }
+        }
+
+        pub fn get_mut(arc: &mut MyArc<T>) -> Option<&mut T> {
+            // This method is different now because the logic to determine that there is only a
+            // single live Arc is now different. In this case given that the existance of at least
+            // one live Arc is represented as a single Weak reference count.
+
+            // Logically lock the weak count to prevent any upgrade/downgrade operations from
+            // happening. We do this by setting the container allocation count to be the max
+            // available.
+            if arc
+                .data()
+                .alloc_count
+                .compare_exchange_weak(1, usize::MAX, Ordering::Acquire, Ordering::Relaxed)
+                .is_err()
+            {
+                return None;
+            }
+            let is_unique = arc.data().data_ref_count.load(Ordering::Relaxed) == 1;
+
+            // Store a data_ref_count of 1 using Release ordering. This matches any Acquire load
+            // and ensures that any changes to data_ref_count in a downgrade does not change the
+            // is_unqiue condition.
+            arc.data().data_ref_count.store(1, Ordering::Release);
+            if !is_unique {
+                return None;
+            }
+            // Unlock the data allocation count.
+            fence(Ordering::Acquire);
+            unsafe { Some(&mut *arc.data().data.get()) }
+        }
+
+        pub fn downgrade(arc: &Self) -> WeakRef<T> {
+            let mut n = arc.data().alloc_count.load(Ordering::Relaxed);
+            loop {
+                if n == usize::MAX {
+                    // Spin while the lock is held by the get_mut method.
+                    std::hint::spin_loop();
+                    n = arc.data().alloc_count.load(Ordering::Relaxed);
+                    continue;
+                }
+                assert!(n < usize::MAX - 1);
+            }
+        }
+
+        fn data(&self) -> &ArcData<T> {
+            unsafe { self.arc_ptr.as_ref() }
+        }
+    }
+
+    impl<T> Deref for MyArc<T> {
+        type Target = T;
+        fn deref(&self) -> &T {
+            unsafe { &*self.data().data.get() }
+        }
+    }
+
+    impl<T> Clone for MyArc<T> {
+        fn clone(&self) -> MyArc<T> {
+            if self.data().data_ref_count.fetch_add(1, Ordering::Relaxed) >= usize::MAX {
+                std::process::abort()
+            }
+            MyArc {
+                arc_ptr: self.arc_ptr,
+            }
+        }
+    }
+
+    impl<T> Drop for MyArc<T> {
+        fn drop(&mut self) {
+            // only need to decrement the data ref counter that represents the counter of the
+            // actually allocated references to the data.
+            if self.data().data_ref_count.fetch_sub(1, Ordering::Release) == 1 {
+                fence(Ordering::Acquire);
+                // Here we drop the data since we are dropping the last live Arc.
+                // Get a raw mutable pointer to the data allocated inside the ManuallyDrop.
+                unsafe { ManuallyDrop::drop(&mut *self.data().data.get()) }
+                // Then since we have no valid data allocations left, we need to drop the WeakRef
+                // that represents there is a valid Arc
+                drop(WeakRef {
+                    arc_ptr: self.arc_ptr,
+                })
+            }
+        }
+    }
+
+    pub struct WeakRef<T> {
+        arc_ptr: NonNull<ArcData<T>>,
+    }
+
+    unsafe impl<T: Send + Sync> Send for WeakRef<T> {}
+    unsafe impl<T: Send + Sync> Sync for WeakRef<T> {}
+
+    impl<T> WeakRef<T> {
+        fn data(&self) -> &ArcData<T> {
+            unsafe { self.arc_ptr.as_ref() }
+        }
+
+        pub fn upgrade(&self) -> Option<MyArc<T>> {
+            // This function is the same outside of incrementing the Weak refernce count given that
+            // we are no longer counting all live Arc's as a weak.
+            let mut n = self.data().data_ref_count.load(Ordering::Relaxed);
+            loop {
+                if n == 0 {
+                    return None;
+                }
+                assert!(n < usize::MAX);
+                if let Err(e) = self.data().data_ref_count.compare_exchange_weak(
+                    n,
+                    n + 1,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                ) {
+                    n = e;
+                    continue;
+                }
+                return Some(MyArc {
+                    arc_ptr: self.arc_ptr,
+                });
+            }
+        }
+    }
+
+    impl<T> Clone for WeakRef<T> {
+        fn clone(&self) -> WeakRef<T> {
+            if self.data().alloc_count.fetch_add(1, Ordering::Relaxed) >= usize::MAX / 2 {
+                std::process::abort()
+            }
+
+            WeakRef {
+                arc_ptr: self.arc_ptr,
+            }
+        }
+    }
+
+    impl<T> Drop for WeakRef<T> {
+        fn drop(&mut self) {
+            if self.data().alloc_count.fetch_sub(1, Ordering::Release) == 1 {
+                fence(Ordering::Acquire);
+                unsafe { drop(Box::from_raw(self.arc_ptr.as_ptr())) }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
