@@ -857,20 +857,26 @@ pub mod opimized_basic_arc {
 
             // Logically lock the weak count to prevent any upgrade/downgrade operations from
             // happening. We do this by setting the container allocation count to be the max
-            // available.
+            // available. Using compare_exchange to esnure that the previous count before locking
+            // is 1, validating that this is the only Arc. If this is not the case, then the caller
+            // cannot get exclusive access to the data inside the Arc. When the alloc count is 1,
+            // that means there is either only one weak remaining, or at least 1 Arc remaining.
             if arc
                 .data()
                 .alloc_count
-                .compare_exchange_weak(1, usize::MAX, Ordering::Acquire, Ordering::Relaxed)
+                .compare_exchange(1, usize::MAX, Ordering::Acquire, Ordering::Relaxed)
                 .is_err()
             {
                 return None;
             }
+
+            // This is the critical section inside the logical lock to ensure exclusive access.
+            // This is where unique access to Arc is validated.
             let is_unique = arc.data().data_ref_count.load(Ordering::Relaxed) == 1;
 
             // Store a data_ref_count of 1 using Release ordering. This matches any Acquire load
             // and ensures that any changes to data_ref_count in a downgrade does not change the
-            // is_unqiue condition.
+            // is_unqiue condition. This effectively unlocking the data allocation atomic count.
             arc.data().data_ref_count.store(1, Ordering::Release);
             if !is_unique {
                 return None;
@@ -884,7 +890,8 @@ pub mod opimized_basic_arc {
             let mut n = arc.data().alloc_count.load(Ordering::Relaxed);
             loop {
                 if n == usize::MAX {
-                    // Spin while the lock is held by the get_mut method.
+                    // Spin while the lock is held by the get_mut method on the container
+                    // allocation count.
                     std::hint::spin_loop();
                     n = arc.data().alloc_count.load(Ordering::Relaxed);
                     continue;
@@ -918,15 +925,18 @@ pub mod opimized_basic_arc {
 
     impl<T> Drop for MyArc<T> {
         fn drop(&mut self) {
-            // only need to decrement the data ref counter that represents the counter of the
+            // Only need to decrement the data ref counter that represents the counter of the
             // actually allocated references to the data.
             if self.data().data_ref_count.fetch_sub(1, Ordering::Release) == 1 {
                 fence(Ordering::Acquire);
                 // Here we drop the data since we are dropping the last live Arc.
                 // Get a raw mutable pointer to the data allocated inside the ManuallyDrop.
+                // Dropping data inside the ManuallyDrop needs to be explicitly dropped with
+                // ManuallyDrop::drop(...).
                 unsafe { ManuallyDrop::drop(&mut *self.data().data.get()) }
                 // Then since we have no valid data allocations left, we need to drop the WeakRef
-                // that represents there is a valid Arc
+                // that represents there is a valid Arc to decrement the container allocation
+                // count.
                 drop(WeakRef {
                     arc_ptr: self.arc_ptr,
                 })
