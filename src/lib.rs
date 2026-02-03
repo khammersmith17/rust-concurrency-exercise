@@ -803,7 +803,7 @@ pub mod arc_with_weak_pointers {
     }
 }
 
-pub mod opimized_basic_arc {
+pub mod optimized_basic_arc {
     use std::cell::UnsafeCell;
     use std::mem::ManuallyDrop;
     use std::ops::Deref;
@@ -897,6 +897,21 @@ pub mod opimized_basic_arc {
                     continue;
                 }
                 assert!(n < usize::MAX - 1);
+
+                // Try until we can safe increment the container allocation count. Update the
+                // current count we have stored in until a successful compare exchange occurs.
+                if let Err(e) = arc.data().alloc_count.compare_exchange_weak(
+                    n,
+                    n + 1,
+                    Ordering::Acquire,
+                    Ordering::Relaxed,
+                ) {
+                    n = e;
+                    continue;
+                }
+                return WeakRef {
+                    arc_ptr: arc.arc_ptr,
+                };
             }
         }
 
@@ -1131,6 +1146,53 @@ mod test {
     #[test]
     fn test_arc_weak_ref() {
         use arc_with_weak_pointers::MyArc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        static NUM_DROPS: AtomicUsize = AtomicUsize::new(0);
+
+        struct DetectDrop;
+
+        impl Drop for DetectDrop {
+            fn drop(&mut self) {
+                NUM_DROPS.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        let x = MyArc::new((1, DetectDrop));
+
+        // create 2 weak refs
+        let y = MyArc::downgrade(&x);
+        let z = MyArc::downgrade(&x);
+
+        let t = std::thread::spawn(move || {
+            // upgrade one of the weak refs
+            // this is valid given that the strong count is 1.
+            let y = y.upgrade().unwrap();
+            // the value loaded should be the same loaded into the initial Arc
+            assert_eq!(y.0, 1);
+        });
+
+        assert_eq!(x.0, 1);
+        t.join().unwrap();
+
+        // data should not be dropped yet.
+        assert_eq!(NUM_DROPS.load(Ordering::Relaxed), 0);
+        // upgrade should be valid given that at least one arc is still valid.
+        assert!(z.upgrade().is_some());
+
+        // dropping the last live Arc.
+        drop(x);
+
+        // data should be dropped at this point.
+        assert_eq!(NUM_DROPS.load(Ordering::Relaxed), 1);
+
+        // upgrade should not work anymore given that the data has been dropped.
+        assert!(z.upgrade().is_none());
+    }
+
+    #[test]
+    fn test_optimized_arc_weak_ref() {
+        use optimized_basic_arc::MyArc;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         static NUM_DROPS: AtomicUsize = AtomicUsize::new(0);
